@@ -1,4 +1,5 @@
 import os
+os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = '114514'
 import pygame
 from queue import Queue
 from copy import deepcopy
@@ -18,11 +19,11 @@ LEFT = 2
 RIGHT = 3
 
 board = [
-    [X, C, H, X],
-    [X, 0, X, X],
-    [S, S, H, 0],
-    [H, 0, H, 0],
-    [0, H, 0, 0]]
+    [X, 0, 0, X],
+    [X, H, H, S],
+    [H, X, S, S],
+    [C, S, 0, X],
+    [X, 0, H, X]]
 
 def toTuple(b):
     return tuple(tuple(x) for x in b)
@@ -89,7 +90,6 @@ def find(init_board):
                         continue
                     history[b_next_t] = b
                     if final(b_next):
-                        print('find!')
                         path = [b_next]
                         next_path = b
                         while next_path is not 0:
