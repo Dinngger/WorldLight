@@ -6,7 +6,6 @@ import torchvision
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.autograd import Variable
 from tqdm import tqdm
 
 
@@ -376,51 +375,33 @@ class Split2d(nn.Module):
             return z, logdet
 
 
-def squeeze2d(input, factor=2):
-    assert factor >= 1 and isinstance(factor, int)
-    if factor == 1:
-        return input
-    size = input.size()
-    B = size[0]
-    C = size[1]
-    H = size[2]
-    W = size[3]
-    assert H % factor == 0 and W % factor == 0, "{}".format((H, W))
-    x = input.view(B, C, H // factor, factor, W // factor, factor)
-    x = x.permute(0, 1, 3, 5, 2, 4).contiguous()
-    x = x.view(B, C * factor * factor, H // factor, W // factor)
-    return x
-
-
-def unsqueeze2d(input, factor=2):
-    assert factor >= 1 and isinstance(factor, int)
-    factor2 = factor ** 2
-    if factor == 1:
-        return input
-    size = input.size()
-    B = size[0]
-    C = size[1]
-    H = size[2]
-    W = size[3]
-    assert C % (factor2) == 0, "{}".format(C)
-    x = input.view(B, C // factor2, factor, factor, H, W)
-    x = x.permute(0, 1, 4, 2, 5, 3).contiguous()
-    x = x.view(B, C // (factor2), H * factor, W * factor)
-    return x
-
-
 class SqueezeLayer(nn.Module):
     def __init__(self, factor):
         super().__init__()
+        assert factor >= 1 and isinstance(factor, int)
         self.factor = factor
 
     def forward(self, input, logdet=None, reverse=False):
+        factor = self.factor
         if not reverse:
-            output = squeeze2d(input, self.factor)
-            return output, logdet
+            if factor == 1:
+                return input, logdet
+            B, C, H, W = input.size()
+            assert H % factor == 0 and W % factor == 0, "{}".format((H, W))
+            x = input.view(B, C, H // factor, factor, W // factor, factor)
+            x = x.permute(0, 1, 3, 5, 2, 4).contiguous()
+            x = x.view(B, C * factor * factor, H // factor, W // factor)
+            return x, logdet
         else:
-            output = unsqueeze2d(input, self.factor)
-            return output, logdet
+            factor2 = factor ** 2
+            if factor == 1:
+                return input, logdet
+            B, C, H, W = input.size()
+            assert C % (factor2) == 0, "{}".format(C)
+            x = input.view(B, C // factor2, factor, factor, H, W)
+            x = x.permute(0, 1, 4, 2, 5, 3).contiguous()
+            x = x.view(B, C // (factor2), H * factor, W * factor)
+            return x, logdet
 
 
 def f(in_channels, out_channels, hidden_channels):
@@ -587,15 +568,14 @@ class Glow(nn.Module):
     def __init__(self, batch_size):
         super().__init__()
         self.batch_size = batch_size
-        self.flow = FlowNet(image_shape=(28, 28, 1),
-                            hidden_channels=128,
-                            K=4,
-                            L=2,
+        self.flow = FlowNet(image_shape=(32, 32, 1),
+                            hidden_channels=256,
+                            K=8,
+                            L=5,
                             actnorm_scale=1.0,
                             flow_permutation="invconv",
                             flow_coupling="affine",
                             LU_decomposed=False)
-        self.y_classes = 10
         self.register_parameter(
             "prior_h",
             nn.Parameter(torch.zeros([batch_size,
@@ -603,121 +583,44 @@ class Glow(nn.Module):
                                       self.flow.output_shapes[-1][2],
                                       self.flow.output_shapes[-1][3]])))
 
-    def prior(self, y_onehot=None):
-        B, C = self.prior_h.size(0), self.prior_h.size(1)
+    def prior(self):
         h = self.prior_h.detach().clone()
         assert torch.sum(h) == 0.0
         return split_feature(h, "split")
 
-    def forward(self, x=None, y_onehot=None, z=None,
+    def forward(self, x=None, z=None,
                 eps_std=None, reverse=False):
         if not reverse:
-            return self.normal_flow(x, y_onehot)
+            return self.normal_flow(x)
         else:
-            return self.reverse_flow(z, y_onehot, eps_std)
+            return self.reverse_flow(z, eps_std)
 
-    def normal_flow(self, x, y_onehot):
+    def normal_flow(self, x):
         pixels = num_pixels(x)
         z = x + torch.normal(mean=torch.zeros_like(x),
                              std=torch.ones_like(x) * (1. / 256.))
         logdet = torch.zeros_like(x[:, 0, 0, 0])
         logdet += float(-np.log(256.) * pixels)
-        # encode
         z, objective = self.flow(z, logdet=logdet, reverse=False)
-        # prior
-        mean, logs = self.prior(y_onehot)
+        mean, logs = self.prior()
         objective += GaussianDiag.logp(mean, logs, z)
-
-        # return
         nll = (-objective) / float(np.log(2.) * pixels)
-        return z, nll, None
+        return z, nll
 
-    def reverse_flow(self, z, y_onehot, eps_std):
+    def reverse_flow(self, z, eps_std):
         with torch.no_grad():
-            mean, logs = self.prior(y_onehot)
+            mean, logs = self.prior()
             if z is None:
                 z = GaussianDiag.sample(mean, logs, eps_std)
             x = self.flow(z, eps_std=eps_std, reverse=True)
         return x
-
-    def set_actnorm_init(self, inited=True):
-        for name, m in self.named_modules():
-            if (m.__class__.__name__.find("ActNorm") >= 0):
-                m.inited = inited
-
-    def generate_z(self, img):
-        self.eval()
-        B = self.batch_size
-        x = img.unsqueeze(0).repeat(B, 1, 1, 1).cuda()
-        z,_, _ = self(x)
-        self.train()
-        return z[0].detach().cpu().numpy()
-
-    def generate_attr_deltaz(self, dataset):
-        assert "y_onehot" in dataset[0]
-        self.eval()
-        with torch.no_grad():
-            B = self.batch_size
-            N = len(dataset)
-            attrs_pos_z = [[0, 0] for _ in range(self.y_classes)]
-            attrs_neg_z = [[0, 0] for _ in range(self.y_classes)]
-            for i in tqdm(range(0, N, B)):
-                j = min([i + B, N])
-                # generate z for data from i to j
-                xs = [dataset[k]["x"] for k in range(i, j)]
-                while len(xs) < B:
-                    xs.append(dataset[0]["x"])
-                xs = torch.stack(xs).cuda()
-                zs, _, _ = self(xs)
-                for k in range(i, j):
-                    z = zs[k - i].detach().cpu().numpy()
-                    # append to different attrs
-                    y = dataset[k]["y_onehot"]
-                    for ai in range(self.y_classes):
-                        if y[ai] > 0:
-                            attrs_pos_z[ai][0] += z
-                            attrs_pos_z[ai][1] += 1
-                        else:
-                            attrs_neg_z[ai][0] += z
-                            attrs_neg_z[ai][1] += 1
-                # break
-            deltaz = []
-            for ai in range(self.y_classes):
-                if attrs_pos_z[ai][1] == 0:
-                    attrs_pos_z[ai][1] = 1
-                if attrs_neg_z[ai][1] == 0:
-                    attrs_neg_z[ai][1] = 1
-                z_pos = attrs_pos_z[ai][0] / float(attrs_pos_z[ai][1])
-                z_neg = attrs_neg_z[ai][0] / float(attrs_neg_z[ai][1])
-                deltaz.append(z_pos - z_neg)
-        self.train()
-        return deltaz
-
-    @staticmethod
-    def loss_generative(nll):
-        # Generative loss
-        return torch.mean(nll)
-
-    @staticmethod
-    def loss_multi_classes(y_logits, y_onehot):
-        if y_logits is None:
-            return 0
-        else:
-            return Glow.BCE(y_logits, y_onehot.float())
-
-    @staticmethod
-    def loss_class(y_logits, y):
-        if y_logits is None:
-            return 0
-        else:
-            return Glow.CE(y_logits, y.long())
 
 
 mnist = torchvision.datasets.MNIST('/media/dinger/inner/Dataset/pytorch_data',
     train=True, download=False, transform=torchvision.transforms.ToTensor())
 
 batch_size = 128
-num_epochs = 30
+num_epochs = 50
 
 device = torch.device('cuda')
 print('Number of samples: ', len(mnist))
@@ -732,13 +635,15 @@ inputs = list(inputs)
 model = Glow(batch_size).to(device)
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 model.train()
-for epoch in range(num_epochs):
+padding = nn.ZeroPad2d(2)
+for epoch in tqdm(range(num_epochs)):
     for x in inputs:
         if x.shape[0] != batch_size:
             continue
         optimizer.zero_grad()
-        z, nll, y_logits = model(x)
-        loss = Glow.loss_generative(nll)
+        x = padding(x)
+        z, nll = model(x)
+        loss = torch.mean(nll)
         loss.backward()
         optimizer.step()
     print(epoch, loss.item())
