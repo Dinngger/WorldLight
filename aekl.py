@@ -585,6 +585,7 @@ class LPIPSWithDiscriminator(nn.Module):
         self.logvar = nn.Parameter(torch.ones(size=()) * logvar_init)
 
         self.discriminator = NLayerDiscriminator(input_nc=disc_in_channels,
+                                                 ndf=16,
                                                  n_layers=disc_num_layers,
                                                  use_actnorm=use_actnorm
                                                  ).apply(weights_init)
@@ -676,7 +677,7 @@ class AutoencoderKL(pl.LightningModule):
     def __init__(self,
                  ddconfig={
                     'z_channels': 4,
-                    'resolution': 28,
+                    'resolution': 32,
                     'in_channels': 1,
                     'out_ch': 1,
                     'ch': 16,
@@ -684,6 +685,7 @@ class AutoencoderKL(pl.LightningModule):
                     'num_res_blocks': 2,
                     'attn_resolutions': []},
                  z_channels=4,
+                 in_channels=1,
                  embed_dim=4,
                  ckpt_path=None,
                  ignore_keys=[],
@@ -693,7 +695,7 @@ class AutoencoderKL(pl.LightningModule):
         super().__init__()
         self.encoder = Encoder(**ddconfig)
         self.decoder = Decoder(**ddconfig)
-        self.loss = LPIPSWithDiscriminator(disc_start=50001, kl_weight=0.000001, disc_weight=0.5)
+        self.loss = LPIPSWithDiscriminator(disc_start=2001, kl_weight=0.000001, disc_in_channels=in_channels, disc_weight=0.5)
         self.quant_conv = torch.nn.Conv2d(2*z_channels, 2*embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, z_channels, 1)
         self.embed_dim = embed_dim
@@ -768,9 +770,9 @@ class AutoencoderKL(pl.LightningModule):
         inputs = self.get_input(batch)
         reconstructions, posterior = self(inputs)
         sampled = self.decode(torch.randn_like(posterior.sample()))
-        # x_concat = torch.cat([inputs, reconstructions], dim=3)
-        # self.logger.experiment.add_image("reconstructions", torchvision.utils.make_grid(x_concat), 0)
-        self.logger.experiment.add_image("sampled", torchvision.utils.make_grid(sampled), 0)
+        x_concat = torch.cat([inputs, reconstructions], dim=3)
+        self.logger.experiment.add_image("reconstructions", torchvision.utils.make_grid(x_concat))
+        self.logger.experiment.add_image("sampled", torchvision.utils.make_grid(sampled))
 
         aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, 0, self.global_step,
                                         last_layer=self.get_last_layer(), split="val")
@@ -804,7 +806,9 @@ class MNISTDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.prepare_data_per_node = False
         self._log_hyperparams = None
-        self.transform = torchvision.transforms.ToTensor()
+        self.transform = torchvision.transforms.Compose([
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Pad(2)])
 
     def setup(self, stage=None):
         self.mnist_train = torchvision.datasets.MNIST(self.dataset_dir,
