@@ -6,18 +6,55 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torchvision
 from torchvision import transforms
+from matplotlib import pyplot as plt
+
+
+def genMeshGrid(h, w):
+    x = torch.linspace(-1, 1, w)
+    y = torch.linspace(-1, 1, h)
+    return torch.stack(torch.meshgrid(x, y, indexing='xy'))
+
+
+class AttentionConv(nn.Module):
+    def __init__(self, in_channels):
+        super(AttentionConv, self).__init__()
+        self.enc = nn.Conv2d(in_channels, 2 * in_channels, (1, 1))
+
+    def forward(self, x):
+        B, Ci, H, W = x.shape
+        C = Ci * 2
+        x = self.enc(x)
+        x = F.unfold(x, (3, 3), padding=1).view(B, C, 3*3, -1) # (B, C, 9, N)
+        x = x.permute(0, 3, 2, 1) # (B, N, 9, C)
+        mid = x[:, :, 4:5, :]
+
+        # [B, N, 1, C] x [B, N, C, 9] = [B, N, 1, 9]
+        routing = torch.matmul(mid, x.permute(0, 1, 3, 2))
+        routing = F.softmax(routing / np.sqrt(C), -1)
+        # [B, N, 1, 9] x [B, N, 9, C] = [B, N, 1, C]
+        res = torch.matmul(routing, x)
+        return res.squeeze(2).permute(0, 2, 1).view(B, C, H, W)
 
 class TCNN(nn.Module):
     def __init__(self):
         super(TCNN, self).__init__()
-        self.cnn = nn.Conv2d(1, 7, 6, 2, 2) # (B, 7, 14, 14)  2 offset + 1 attention + 4 features
-        self.pointNet = nn.Sequential(
-            nn.Conv1d()
-        )
+        self.coords = None
+        self.cnn = nn.Conv2d(1, 4, 6, 2, 2) # (B, 4, 14, 14)
+        self.acnn = AttentionConv(4)        # (B, 8, 14, 14)
+        # self.acnn = nn.Conv2d(4, 8, 3, 1, 1)    # compare to acnn
+        self.pointNet = nn.Conv1d(10, 64, 1)
+        self.fc = nn.Linear(64, 10)
 
     def forward(self, x):
-        x = self.cnn(x)
-        return x.squeeze()
+        x = self.acnn(self.cnn(x).relu())
+        B, C, H, W = x.shape
+        if self.coords is None:
+            self.coords = genMeshGrid(H, W).unsqueeze(0).to(x.device) #(1, 2, H, W)
+        x = torch.cat((self.coords.expand(B, 2, H, W), x), 1)
+        points = x.view(B, 10, H * W)
+        points = self.pointNet(points)
+        feature = torch.max(points, 2)[0]
+        return self.fc(feature)
 
 mnist_train = torchvision.datasets.MNIST('/media/dinger/inner/Dataset/pytorch_data',
     train=True, download=False, transform=transforms.ToTensor())
@@ -29,9 +66,6 @@ test_loader = torch.utils.data.DataLoader(mnist_test, batch_size=128)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-model = TCNN().to(device)
-loss_fn = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
 def train(dataloader, model, loss_fn, optimizer):
     size = len(dataloader.dataset)
@@ -67,9 +101,30 @@ def test(dataloader, model, loss_fn):
     correct /= size
     print(f"Test Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f} \n")
 
-epochs = 5
-for t in range(epochs):
-    print(f"Epoch {t+1}\n-------------------------------")
-    train(train_loader, model, loss_fn, optimizer)
-    test(test_loader, model, loss_fn)
-print("Done!")
+model = TCNN().to(device)
+
+if False:
+    param_count = 0
+    for param in model.parameters():
+        param_count += param.view(-1).size()[0]
+    print("Parameters: ", param_count)
+
+    loss_fn = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    epochs = 20
+    for t in range(epochs):
+        print(f"Epoch {t+1}\n-------------------------------")
+        train(train_loader, model, loss_fn, optimizer)
+        test(test_loader, model, loss_fn)
+    print("Done!")
+    torch.save(model.state_dict(), "tcnn.pt")
+else:
+    model.load_state_dict(torch.load("tcnn.pt"))
+    for X, y in train_loader:
+        x = model.cnn(X.to(device)).relu()
+        img = torchvision.utils.make_grid(x[:64, :3, ...])
+        img = np.squeeze(img.detach().cpu().numpy())
+        img = np.transpose(img, [1,2,0])
+        plt.imshow(img)
+        plt.show()
+        break
