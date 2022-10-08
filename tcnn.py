@@ -15,6 +15,19 @@ def genMeshGrid(h, w):
     return torch.stack(torch.meshgrid(x, y, indexing='xy'))
 
 
+class AttentionPooling(nn.Module):
+    def __init__(self, d_in, d_out, n_out):
+        super(AttentionPooling, self).__init__()
+        self.d_in = d_in
+        self.inducing_points = nn.Parameter(torch.Tensor(n_out, d_out, d_in))
+        nn.init.xavier_uniform_(self.inducing_points)
+    
+    def forward(self, x):
+        routing = torch.matmul(self.inducing_points.expand(x.shape[0], 1, 1), x.permute(0, 2, 1))
+        routing = F.softmax(routing / np.sqrt(self.d_in), -1)
+        return torch.matmul(routing, x)
+
+
 class AttentionConv(nn.Module):
     def __init__(self, in_channels):
         super(AttentionConv, self).__init__()
@@ -35,18 +48,26 @@ class AttentionConv(nn.Module):
         res = torch.matmul(routing, x)
         return res.squeeze(2).permute(0, 2, 1).view(B, C, H, W)
 
+
 class TCNN(nn.Module):
     def __init__(self):
         super(TCNN, self).__init__()
         self.coords = None
-        self.cnn = nn.Conv2d(1, 4, 6, 2, 2) # (B, 4, 14, 14)
-        self.acnn = AttentionConv(4)        # (B, 8, 14, 14)
+        self.cnn = nn.Conv2d(1, 8, 3, padding=1)
+        self.pool = nn.MaxPool2d(4, 4)
+        self.ap1 = AttentionPooling(8, 8, 10)
+        self.feat2coords = nn.Conv1d(8, 2, 1)
+
+        # self.acnn = AttentionConv(4)        # (B, 8, 14, 14)
         # self.acnn = nn.Conv2d(4, 8, 3, 1, 1)    # compare to acnn
         self.pointNet = nn.Conv1d(10, 64, 1)
         self.fc = nn.Linear(64, 10)
 
     def forward(self, x):
-        x = self.acnn(self.cnn(x).relu())
+        x = self.cnn(x)
+        top = self.pool(x)
+        seeds = self.ap1(top)
+
         B, C, H, W = x.shape
         if self.coords is None:
             self.coords = genMeshGrid(H, W).unsqueeze(0).to(x.device) #(1, 2, H, W)
@@ -119,10 +140,14 @@ if False:
     print("Done!")
     torch.save(model.state_dict(), "tcnn.pt")
 else:
-    model.load_state_dict(torch.load("tcnn.pt"))
+    # model.load_state_dict(torch.load("tcnn.pt"))
     for X, y in train_loader:
-        x = model.cnn(X.to(device)).relu()
-        img = torchvision.utils.make_grid(x[:64, :3, ...])
+        x = X.to(device)
+        # x = F.conv2d(x, torch.ones((1, 1, 3, 3), device=x.device))
+        # B, C, H, W = x.shape
+        # x = F.softmax(x.view(B, -1), -1).view(B, C, H, W)
+        # x = model.cnn(X.to(device)).relu()
+        img = torchvision.utils.make_grid(x[:64, ...], normalize=True)
         img = np.squeeze(img.detach().cpu().numpy())
         img = np.transpose(img, [1,2,0])
         plt.imshow(img)
